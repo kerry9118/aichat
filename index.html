@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多智能體對話</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #f4f6f8; margin: 0; padding: 10px; box-sizing: border-box; }
+        .container { display: flex; flex-direction: column; height: 100%; width: 100%; max-width: 700px; background: #fff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        #status { text-align: center; padding: 10px; color: #666; font-size: 0.9em; border-bottom: 1px solid #e0e0e0; }
+        #dialogue-container { flex-grow: 1; padding: 20px; overflow-y: auto; }
+        .message { display: flex; flex-direction: column; max-width: 80%; margin-bottom: 12px; }
+        .message-content { padding: 10px 15px; border-radius: 18px; line-height: 1.5; white-space: pre-wrap; }
+        .user-message { align-self: flex-end; }
+        .user-message .message-content { background-color: #007bff; color: white; border-bottom-right-radius: 4px; }
+        .ai-message { align-self: flex-start; }
+        .ai-message .message-content { background-color: #e9e9eb; color: #333; border-bottom-left-radius: 4px; }
+        .thought-process { display: none; margin-top: 8px; padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; font-size: 0.85em; color: #6c757d; white-space: pre-wrap; }
+        .toggle-think-btn { background: none; border: 1px solid #ccc; color: #555; cursor: pointer; font-size: 0.8em; padding: 2px 8px; border-radius: 12px; margin-top: 8px; align-self: flex-start; }
+        .controls { padding: 20px; border-top: 1px solid #e0e0e0; text-align: center; }
+        #recordButton { padding: 12px 25px; font-size: 1.2em; cursor: pointer; border-radius: 50px; border: none; background-color: #28a745; color: white; transition: background-color 0.3s, transform 0.1s; }
+        #recordButton:hover { background-color: #218838; }
+        #recordButton.recording { background-color: #dc3545; transform: scale(1.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="status">點擊按鈕開始與 AI 對話</div>
+        <div id="dialogue-container"></div>
+        <div class="controls">
+            <button id="recordButton">按住說話</button>
+        </div>
+    </div>
+
+    <script>
+        const recordButton = document.getElementById('recordButton');
+        const statusDiv = document.getElementById('status');
+        const dialogueContainer = document.getElementById('dialogue-container');
+        let ws, mediaRecorder, audioChunks = [], isRecording = false, audioContext, currentAudioSource, currentAiMessageContainer;
+
+        function createMessageContainer(sender) {
+            const container = document.createElement('div');
+            container.className = `message ${sender}-message`;
+            dialogueContainer.appendChild(container);
+            return container;
+        }
+
+        function updateAiMessage(rawText) {
+            if (!currentAiMessageContainer) return;
+
+            const thinkMatch = rawText.match(/<think>([\s\S]*?)<\/think>/);
+            const thinkContent = thinkMatch ? thinkMatch[1].trim() : null;
+            const answerContent = rawText.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+
+            let messageContentDiv = currentAiMessageContainer.querySelector('.message-content');
+            if (!messageContentDiv) {
+                messageContentDiv = document.createElement('div');
+                messageContentDiv.className = 'message-content';
+                currentAiMessageContainer.appendChild(messageContentDiv);
+            }
+            messageContentDiv.textContent = answerContent || '▋';
+
+            let thinkDiv = currentAiMessageContainer.querySelector('.thought-process');
+            if (thinkContent) {
+                if (!thinkDiv) {
+                    thinkDiv = document.createElement('div');
+                    thinkDiv.className = 'thought-process';
+                    let toggleBtn = currentAiMessageContainer.querySelector('.toggle-think-btn');
+                    if (!toggleBtn) {
+                        toggleBtn = document.createElement('button');
+                        toggleBtn.className = 'toggle-think-btn';
+                        toggleBtn.textContent = '顯示思考過程';
+                        toggleBtn.onclick = () => {
+                            const isHidden = thinkDiv.style.display === 'none';
+                            thinkDiv.style.display = isHidden ? 'block' : 'none';
+                            toggleBtn.textContent = isHidden ? '隱藏思考過程' : '顯示思考過程';
+                        };
+                        currentAiMessageContainer.appendChild(toggleBtn);
+                    }
+                    currentAiMessageContainer.appendChild(thinkDiv);
+                }
+                thinkDiv.textContent = thinkContent;
+            }
+            dialogueContainer.scrollTop = dialogueContainer.scrollHeight;
+        }
+
+        function initWebSocket() {
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+            ws.binaryType = 'blob';
+
+            ws.onopen = () => { statusDiv.textContent = "連線成功，可以開始對話了"; console.log("WebSocket connected"); };
+            ws.onclose = () => { statusDiv.textContent = "連線已斷開，請刷新頁面"; console.log("WebSocket disconnected"); };
+            ws.onerror = (error) => { statusDiv.textContent = "連線錯誤"; console.error("WebSocket error:", error); };
+
+            let accumulatedAiText = "";
+            ws.onmessage = async (event) => {
+                if (isRecording) { console.log("使用者正在錄音，跳過傳入的訊息。"); return; }
+
+                if (event.data instanceof Blob) {
+                    console.log("收到音訊資料，準備播放。");
+                    statusDiv.textContent = "正在播放語音...";
+                    playAudio(event.data);
+                    return;
+                }
+
+                try {
+                    const message = JSON.parse(event.data);
+                    if (message.type === 'user_text') {
+                        const userMsgContainer = createMessageContainer('user');
+                        const userMsgContent = document.createElement('div');
+                        userMsgContent.className = 'message-content';
+                        userMsgContent.textContent = message.data;
+                        userMsgContainer.appendChild(userMsgContent);
+                        dialogueContainer.scrollTop = dialogueContainer.scrollHeight;
+
+                        // 準備接收 AI 回覆
+                        accumulatedAiText = "";
+                        currentAiMessageContainer = createMessageContainer('ai');
+                    } else if (message.type === 'text_chunk') {
+                        statusDiv.textContent = "AI 正在輸入...";
+                        accumulatedAiText += message.data;
+                        updateAiMessage(accumulatedAiText);
+                    } else if (message.type === 'stream_end') {
+                        statusDiv.textContent = "AI 已回覆，準備播放語音...";
+                        console.log("文字流接收完畢。");
+                    }
+                } catch (e) {
+                    console.error("無法解析收到的訊息:", e);
+                }
+            };
+        }
+
+        async function playAudio(audioBlob) {
+            if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            try {
+                const arrayBuffer = await audioBlob.arrayBuffer();
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                if (currentAudioSource) currentAudioSource.stop();
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+                currentAudioSource = source;
+                source.onended = () => { statusDiv.textContent = "對話繼續..."; };
+            } catch (e) {
+                console.error("音訊解碼錯誤:", e);
+                statusDiv.textContent = "音訊解碼失敗。";
+            }
+        }
+
+        async function startRecording() {
+            if (currentAudioSource) currentAudioSource.stop();
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert("您的瀏覽器不支援麥克風輸入！"); return; }
+            if (!mediaRecorder) {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                mediaRecorder.ondataavailable = (event) => { if (event.data.size > 0) audioChunks.push(event.data); };
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const reader = new FileReader();
+                    reader.onload = () => ws.send(reader.result.split(',')[1]);
+                    reader.readAsDataURL(audioBlob);
+                    audioChunks = [];
+                };
+            }
+            mediaRecorder.start();
+            isRecording = true;
+            recordButton.classList.add('recording');
+            statusDiv.textContent = "正在聆聽...";
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                recordButton.classList.remove('recording');
+                statusDiv.textContent = "正在處理...";
+            }
+        }
+
+        recordButton.addEventListener('mousedown', startRecording);
+        recordButton.addEventListener('mouseup', stopRecording);
+        recordButton.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+        recordButton.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+
+        initWebSocket();
+    </script>
+</body>
+</html>
